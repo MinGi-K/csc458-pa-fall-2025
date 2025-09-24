@@ -17,7 +17,8 @@
  *
  *---------------------------------------------------------------------*/
 
-void sr_init(struct sr_instance *sr) {
+void sr_init(struct sr_instance *sr)
+{
   /* REQUIRES */
   assert(sr);
 
@@ -53,7 +54,8 @@ void sr_init(struct sr_instance *sr) {
  *---------------------------------------------------------------------*/
 
 void sr_handlepacket(struct sr_instance *sr, uint8_t *packet /* lent */,
-                     unsigned int len, char *interface /* lent */) {
+                     unsigned int len, char *interface /* lent */)
+{
   /* REQUIRES */
   assert(sr);
   assert(packet);
@@ -61,6 +63,12 @@ void sr_handlepacket(struct sr_instance *sr, uint8_t *packet /* lent */,
 
   printf("*** -> Received packet of length %d \n", len);
 
-  /* fill in code here */
+  sr_ethernet_hdr_t *ethernet_header = parse_ethernet_header(sr, packet);
+}
 
-} /* end sr_ForwardPacket */
+// parses and returns pointer to ethernet header.
+sr_ethernet_hdr_t *parse_ethernet_header(struct sr_instance *sr, uint8_t *packet)
+{
+  sr_ethernet_hdr_t *ethernet_header = (sr_ethernet_hdr_t *)packet;
+  return ethernet_header;
+}
