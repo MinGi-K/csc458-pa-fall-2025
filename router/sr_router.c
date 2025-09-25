@@ -69,6 +69,27 @@ void sr_handlepacket(struct sr_instance *sr, uint8_t *packet /* lent */,
   {
     return;
   }
+
+  // temporary - only process IP packets
+  if (packet_parts->packet_type != L2_IP)
+  {
+    return;
+  }
+
+  // verify checksum
+  if (verify_ip_checksum(packet_parts->ip_header, (size_t)packet_parts->ip_header_length) != 1)
+  {
+    return 3; // wrong checksum
+  }
+
+  // check if dst is for router
+  if (is_dst_sr_router_interface(sr, packet_parts->ip_header->ip_dst))
+  {
+    // ICMP echo request
+    if (packet_parts->packet_type == L2_IP && packet_parts->ip_protocol_type == L3_ICMP && packet_parts->icmp_header->icmp_code == 0)
+    {
+    }
+  }
 }
 
 // parses and returns pointer to ethernet header.
@@ -201,4 +222,64 @@ int parse_frame(uint8_t *frame, unsigned int len, struct sr_packet_parts *packet
     packet_parts->arp_header = (sr_arp_hdr_t *)(frame + ether_header_offset);
   }
   return 0;
+}
+
+int is_dst_sr_router_interface(struct sr_instance *sr, uint32_t dst_address_nbo)
+{
+  struct sr_if *sr_interface = sr->if_list;
+  while (sr_interface)
+  {
+    if (sr_interface->ip == dst_address_nbo)
+    {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+uint16_t calculate_ip_checksum(sr_ip_hdr_t *ip_header, size_t len)
+{
+  const uint8_t *pointer = (const uint8_t *)ip_header;
+  ip_header->ip_sum = 0;
+  uint32_t sum = 0;
+
+  for (size_t i = 0; i + 1 < len; i += 2)
+  {
+    uint16_t word = ((uint16_t)pointer[i] << 8) | (uint16_t)pointer[i + 1];
+    sum += word;
+  }
+
+  /* If odd length, pad last byte with zeros on the right. */
+  if (len & 1)
+  {
+    uint16_t last = (uint16_t)pointer[len - 1] << 8;
+    sum += last;
+  }
+  /* Fold carries to 16 bits. */
+  while (sum >> 16)
+    sum = (sum & 0xFFFFu) + (sum >> 16);
+
+  return (uint16_t)~sum;
+}
+
+int verify_ip_checksum(sr_ip_hdr_t *ip_header, size_t len)
+{
+  uint16_t original = ip_header->ip_sum;
+  uint16_t new = calculate_ip_checksum(ip_header, len);
+
+  ip_header->ip_sum = original; // restore back
+  if (original == new)
+  {
+    return 1;
+  }
+  return 0;
+}
+
+int handle_icmp_echo_req(struct sr_if *sr_interface, struct sr_packet_parts *packet_parts)
+{
+  // ETHERNET
+  uint8_t dst_mac[ETHER_ADDR_LEN];
+  memcpy(dst_mac, packet_parts->ether_header->ether_shost, ETHER_ADDR_LEN); // set destination MAC address to source MAC
+  memcpy(packet_parts->ether_header->ether_dhost, dst_mac, ETHER_ADDR_LEN);
+  memcpy(packet_parts->ether_header->ether_shost, sr_interface->addr, ETHER_ADDR_LEN); // set source to interface MAC address
 }

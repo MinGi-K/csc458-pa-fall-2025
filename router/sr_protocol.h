@@ -189,8 +189,8 @@ typedef struct sr_packet_parts
   packet_type_t packet_type;
 
   /* L2 IP header */
-  sr_ip_hdr_t *ip_header; // NULL if packet type is not IP
-  unsigned int ip_header_length;
+  sr_ip_hdr_t *ip_header;        // NULL if packet type is not IP
+  unsigned int ip_header_length; // in bytes
   ip_protocol_type_t ip_protocol_type;
 
   /* L3 ICMP Header */
