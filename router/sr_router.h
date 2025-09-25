@@ -12,19 +12,22 @@
 /* we dont like this debug , but what to do for varargs ? */
 #ifdef _DEBUG_
 #define Debug(x, args...) printf(x, ##args)
-#define DebugMAC(x)                                                            \
-  do {                                                                         \
-    int ivyl;                                                                  \
-    for (ivyl = 0; ivyl < 5; ivyl++)                                           \
-      printf("%02x:", (unsigned char)(x[ivyl]));                               \
-    printf("%02x", (unsigned char)(x[5]));                                     \
+#define DebugMAC(x)                              \
+  do                                             \
+  {                                              \
+    int ivyl;                                    \
+    for (ivyl = 0; ivyl < 5; ivyl++)             \
+      printf("%02x:", (unsigned char)(x[ivyl])); \
+    printf("%02x", (unsigned char)(x[5]));       \
   } while (0)
 #else
-#define Debug(x, args...)                                                      \
-  do {                                                                         \
+#define Debug(x, args...) \
+  do                      \
+  {                       \
   } while (0)
-#define DebugMAC(x)                                                            \
-  do {                                                                         \
+#define DebugMAC(x) \
+  do                \
+  {                 \
   } while (0)
 #endif
 
@@ -43,7 +46,8 @@ struct sr_rt;
  * --------------------------------------------------------------------------
  */
 
-struct sr_instance {
+struct sr_instance
+{
   int sockfd;        /* socket to server */
   char user[32];     /* user name */
   char host[32];     /* host name */

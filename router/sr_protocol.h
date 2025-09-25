@@ -44,7 +44,7 @@
 #define IP_MAXPACKET 65535
 #endif
 
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) ||       \
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
     defined(__OpenBSD__)
 #include <machine/endian.h>
 #include <sys/param.h>
@@ -57,7 +57,8 @@
 
 /* Structure of a ICMP header
  */
-struct sr_icmp_hdr {
+struct sr_icmp_hdr
+{
   uint8_t icmp_type;
   uint8_t icmp_code;
   uint16_t icmp_sum;
@@ -67,7 +68,8 @@ typedef struct sr_icmp_hdr sr_icmp_hdr_t;
 
 /* Structure of a type3 ICMP header
  */
-struct sr_icmp_t3_hdr {
+struct sr_icmp_t3_hdr
+{
   uint8_t icmp_type;
   uint8_t icmp_code;
   uint16_t icmp_sum;
@@ -81,7 +83,8 @@ typedef struct sr_icmp_t3_hdr sr_icmp_t3_hdr_t;
 /*
  * Structure of an internet header, naked of options.
  */
-struct sr_ip_hdr {
+struct sr_ip_hdr
+{
 #if __BYTE_ORDER == __LITTLE_ENDIAN
   unsigned int ip_hl : 4; /* header length */
   unsigned int ip_v : 4;  /* version */
@@ -110,7 +113,8 @@ typedef struct sr_ip_hdr sr_ip_hdr_t;
  *  Ethernet packet header prototype.  Too many O/S's define this differently.
  *  Easy enough to solve that and define it here.
  */
-struct sr_ethernet_hdr {
+struct sr_ethernet_hdr
+{
 #ifndef ETHER_ADDR_LEN
 #define ETHER_ADDR_LEN 6
 #endif
@@ -120,25 +124,30 @@ struct sr_ethernet_hdr {
 } __attribute__((packed));
 typedef struct sr_ethernet_hdr sr_ethernet_hdr_t;
 
-enum sr_ip_protocol {
+enum sr_ip_protocol
+{
   ip_protocol_icmp = 0x0001,
 };
 
-enum sr_ethertype {
+enum sr_ethertype
+{
   ethertype_arp = 0x0806,
   ethertype_ip = 0x0800,
 };
 
-enum sr_arp_opcode {
+enum sr_arp_opcode
+{
   arp_op_request = 0x0001,
   arp_op_reply = 0x0002,
 };
 
-enum sr_arp_hrd_fmt {
+enum sr_arp_hrd_fmt
+{
   arp_hrd_ethernet = 0x0001,
 };
 
-struct sr_arp_hdr {
+struct sr_arp_hdr
+{
   unsigned short ar_hrd;                /* format of hardware address   */
   unsigned short ar_pro;                /* format of protocol address   */
   unsigned char ar_hln;                 /* length of hardware address   */
@@ -151,6 +160,46 @@ struct sr_arp_hdr {
 } __attribute__((packed));
 typedef struct sr_arp_hdr sr_arp_hdr_t;
 
+// L2 because its on the second layer of the onion
+typedef enum
+{
+  L2_UNKNOWN = 0,
+  L2_IP,
+  L2_ARP,
+} packet_type_t;
+
+// L3 because it is the third layer of the onion
+typedef enum
+{
+  L3_NONE = 0,
+  L3_ICMP,
+  L3_TCP,
+  L3_UDP,
+} ip_protocol_type_t;
+
+typedef struct sr_packet_parts
+{
+  /* Whole Frame */
+  uint8_t *frame;
+  unsigned int frame_length;
+
+  /* L1 Ethernet header */
+  sr_ethernet_hdr_t *ether_header;
+  uint16_t ether_type;
+  packet_type_t packet_type;
+
+  /* L2 IP header */
+  sr_ip_hdr_t *ip_header; // NULL if packet type is not IP
+  unsigned int ip_header_length;
+  ip_protocol_type_t ip_protocol_type;
+
+  /* L3 ICMP Header */
+  sr_icmp_hdr_t *icmp_header; /* for echo/echo-reply etc. */
+
+  /* L2 ARP */
+  sr_arp_hdr_t *arp_header;
+};
+
 #define sr_IFACE_NAMELEN 32
 
-#endif /* -- SR_PROTOCOL_H -- */
+#endif
