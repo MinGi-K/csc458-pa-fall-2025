@@ -160,7 +160,7 @@ struct sr_arp_hdr
 } __attribute__((packed));
 typedef struct sr_arp_hdr sr_arp_hdr_t;
 
-// L2 because its on the second layer of the onion
+/* L2 because its on the second layer of the onion */
 typedef enum
 {
   L2_UNKNOWN = 0,
@@ -168,7 +168,7 @@ typedef enum
   L2_ARP,
 } packet_type_t;
 
-// L3 because it is the third layer of the onion
+/* because it is the third layer of the onion */
 typedef enum
 {
   L3_NONE = 0,
@@ -189,8 +189,8 @@ typedef struct sr_packet_parts
   packet_type_t packet_type;
 
   /* L2 IP header */
-  sr_ip_hdr_t *ip_header;        // NULL if packet type is not IP
-  unsigned int ip_header_length; // in bytes
+  sr_ip_hdr_t *ip_header;        /* NULL if packet type is not IP */
+  unsigned int ip_header_length; /* in bytes */
   ip_protocol_type_t ip_protocol_type;
 
   /* L3 ICMP Header */

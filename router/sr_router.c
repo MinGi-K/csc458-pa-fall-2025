@@ -2,6 +2,8 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <string.h> /* memset, memcpy */
+#include <stdlib.h> /* malloc, free   */
 
 #include "sr_arpcache.h"
 #include "sr_if.h"
@@ -61,38 +63,104 @@ void sr_handlepacket(struct sr_instance *sr, uint8_t *packet /* lent */,
   assert(packet);
   assert(interface);
 
-  printf("*** -> Received packet of length %d \n", len);
+  printf("*** -> Received packet of length %u\n", len);
 
-  struct sr_packet_parts *packet_parts;
+  struct sr_packet_parts *packet_parts = malloc(sizeof(struct sr_packet_parts));
+  if (!packet_parts)
+  {
+    printf("*** drop: malloc sr_packet_parts failed\n");
+    return;
+  }
+
   int error = parse_frame(packet, len, packet_parts);
   if (error != 0)
   {
+    printf("*** drop: parse_frame error=%d\n", error);
+    free(packet_parts);
     return;
   }
 
-  // temporary - only process IP packets
+  /* check for ARP */
+  if (packet_parts->packet_type == L2_ARP)
+  {
+    struct sr_if *in_if = sr_get_interface(sr, interface);
+    /* sanity check */
+    if (!in_if)
+    {
+      printf("*** drop: ARP but sr_get_interface('%s') NULL\n", interface);
+      free(packet_parts);
+      return;
+    }
+    if (!packet_parts->arp_header)
+    {
+      printf("*** drop: ARP path but arp_header NULL\n");
+      free(packet_parts);
+      return;
+    }
+
+    uint16_t op = ntohs(packet_parts->arp_header->ar_op);
+    if (op == arp_op_request)
+    {
+      handle_arp_request(sr, in_if, packet_parts);
+    }
+    else
+    {
+      /* TODO: handle arp dispatch later. */
+      printf("*** note: ARP op=0x%04x ignored for now\n", op);
+    }
+
+    free(packet_parts);
+    return;
+  }
+
+  /* temporary - only process IP packets */
   if (packet_parts->packet_type != L2_IP)
   {
+    printf("*** drop: non-IP EtherType=0x%04x, packet_type=%d\n",
+           packet_parts->ether_type, (int)packet_parts->packet_type);
+    free(packet_parts);
     return;
   }
 
-  // verify checksum
+  /* verify checksum */
   if (verify_ip_checksum(packet_parts->ip_header, (size_t)packet_parts->ip_header_length) != 1)
   {
-    return 3; // wrong checksum
+    printf("*** drop: bad IPv4 header checksum\n");
+    free(packet_parts);
+    return; /* wrong checksum */
   }
 
-  // check if dst is for router
+  /* check if dst is for router */
   if (is_dst_sr_router_interface(sr, packet_parts->ip_header->ip_dst))
   {
-    // ICMP echo request
-    if (packet_parts->packet_type == L2_IP && packet_parts->ip_protocol_type == L3_ICMP && packet_parts->icmp_header->icmp_code == 0)
+    /* ICMP echo request */
+    if (packet_parts->packet_type == L2_IP &&
+        packet_parts->ip_protocol_type == L3_ICMP &&
+        packet_parts->icmp_header &&
+        packet_parts->icmp_header->icmp_code == 0 &&
+        packet_parts->icmp_header->icmp_type == 8)
     {
+      struct sr_if *actual_interface = sr_get_interface(sr, interface);
+      if (!actual_interface)
+      {
+        printf("*** drop: sr_get_interface('%s') returned NULL\n", interface);
+        free(packet_parts);
+        return;
+      }
+      handle_icmp_echo_req(sr, actual_interface, packet_parts);
     }
+    /* else: other to-me traffic (TCP/UDP) not handled yet in Phase 2 */
   }
+  else
+  {
+    /* Not for me; forwarding not implemented yet */
+    printf("*** drop: dst is not router IP (forwarding not implemented yet)\n");
+  }
+
+  free(packet_parts);
 }
 
-// parses and returns pointer to ethernet header.
+/* parses and returns pointer to ethernet header. */
 int parse_frame(uint8_t *frame, unsigned int len, struct sr_packet_parts *packet_parts)
 {
   memset(packet_parts, 0, sizeof(*packet_parts));
@@ -107,8 +175,8 @@ int parse_frame(uint8_t *frame, unsigned int len, struct sr_packet_parts *packet
   /* L1 Ethernet Header */
   if (len < sizeof(sr_ethernet_hdr_t))
   {
-    fprintf(stderr, "[parse_frame] too short for Ethernet header: len=%u need>=%zu\n",
-            len, sizeof(sr_ethernet_hdr_t));
+    printf("*** drop: too short for Ethernet header: len=%u need>=%zu\n",
+           len, sizeof(sr_ethernet_hdr_t));
     return 1;
   }
 
@@ -133,8 +201,8 @@ int parse_frame(uint8_t *frame, unsigned int len, struct sr_packet_parts *packet
   {
     if (len < ether_header_offset + sizeof(sr_ip_hdr_t))
     {
-      fprintf(stderr, "[parse_frame] too short for minimal IP header: len=%u need>=%u\n",
-              len, (unsigned)(ether_header_offset + sizeof(sr_ip_hdr_t)));
+      printf("*** drop: too short for minimal IP header: len=%u need>=%u\n",
+             len, (unsigned)(ether_header_offset + sizeof(sr_ip_hdr_t)));
       return 1;
     }
 
@@ -143,23 +211,23 @@ int parse_frame(uint8_t *frame, unsigned int len, struct sr_packet_parts *packet
 
     if (packet_parts->ip_header->ip_v != 4)
     {
-      fprintf(stderr, "[parse_frame] not IPv4: ip_v=%u\n", packet_parts->ip_header->ip_v);
+      printf("*** drop: not IPv4: ip_v=%u\n", packet_parts->ip_header->ip_v);
       return 2; /* version wrong */
     }
 
     if (packet_parts->ip_header_length < sizeof(sr_ip_hdr_t))
     {
-      fprintf(stderr, "[parse_frame] invalid IP header length: ihl=%u (%u bytes) < %zu\n",
-              packet_parts->ip_header->ip_hl,
-              packet_parts->ip_header_length,
-              sizeof(sr_ip_hdr_t));
+      printf("*** drop: invalid IP header length: ihl=%u (%u bytes) < %zu\n",
+             packet_parts->ip_header->ip_hl,
+             packet_parts->ip_header_length,
+             sizeof(sr_ip_hdr_t));
       return 1;
     }
 
     if (len < sizeof(sr_ethernet_hdr_t) + packet_parts->ip_header_length)
     {
-      fprintf(stderr, "[parse_frame] frame too short for full IP header: len=%u need>=%u\n",
-              len, (unsigned)(sizeof(sr_ethernet_hdr_t) + packet_parts->ip_header_length));
+      printf("*** drop: frame too short for full IP header: len=%u need>=%u\n",
+             len, (unsigned)(sizeof(sr_ethernet_hdr_t) + packet_parts->ip_header_length));
       return 1;
     }
 
@@ -167,8 +235,8 @@ int parse_frame(uint8_t *frame, unsigned int len, struct sr_packet_parts *packet
 
     if (ether_header_offset + ip_total_len > len)
     {
-      fprintf(stderr, "[parse_frame] IP total length exceeds frame: ip_total_len=%u, frame_len=%u, eth_off=%u\n",
-              ip_total_len, len, ether_header_offset);
+      printf("*** drop: IP total length exceeds frame: ip_total_len=%u, frame_len=%u, eth_off=%u\n",
+             ip_total_len, len, ether_header_offset);
       return 1;
     }
 
@@ -180,15 +248,15 @@ int parse_frame(uint8_t *frame, unsigned int len, struct sr_packet_parts *packet
 
       if (len < sizeof(sr_ethernet_hdr_t) + packet_parts->ip_header_length + sizeof(sr_icmp_hdr_t))
       {
-        fprintf(stderr, "[parse_frame] frame too short for ICMP header: len=%u need>=%u\n",
-                len, (unsigned)(sizeof(sr_ethernet_hdr_t) + packet_parts->ip_header_length + sizeof(sr_icmp_hdr_t)));
+        printf("*** drop: frame too short for ICMP header: len=%u need>=%u\n",
+               len, (unsigned)(sizeof(sr_ethernet_hdr_t) + packet_parts->ip_header_length + sizeof(sr_icmp_hdr_t)));
         return 1;
       }
 
       if (ip_total_len < packet_parts->ip_header_length + sizeof(sr_icmp_hdr_t))
       {
-        fprintf(stderr, "[parse_frame] IP total length too small for ICMP header: ip_total_len=%u need>=%u\n",
-                ip_total_len, (unsigned)(packet_parts->ip_header_length + sizeof(sr_icmp_hdr_t)));
+        printf("*** drop: IP total length too small for ICMP header: ip_total_len=%u need>=%u\n",
+               ip_total_len, (unsigned)(packet_parts->ip_header_length + sizeof(sr_icmp_hdr_t)));
         return 1;
       }
 
@@ -214,8 +282,8 @@ int parse_frame(uint8_t *frame, unsigned int len, struct sr_packet_parts *packet
 
     if (len < ether_header_offset + sizeof(sr_arp_hdr_t))
     {
-      fprintf(stderr, "[parse_frame] too short for ARP header: len=%u need>=%u\n",
-              len, (unsigned)(ether_header_offset + sizeof(sr_arp_hdr_t)));
+      printf("*** drop: too short for ARP header: len=%u need>=%u\n",
+             len, (unsigned)(ether_header_offset + sizeof(sr_arp_hdr_t)));
       return 1;
     }
 
@@ -233,41 +301,18 @@ int is_dst_sr_router_interface(struct sr_instance *sr, uint32_t dst_address_nbo)
     {
       return 1;
     }
+    sr_interface = sr_interface->next;
   }
   return 0;
-}
-
-uint16_t calculate_ip_checksum(sr_ip_hdr_t *ip_header, size_t len)
-{
-  const uint8_t *pointer = (const uint8_t *)ip_header;
-  ip_header->ip_sum = 0;
-  uint32_t sum = 0;
-
-  for (size_t i = 0; i + 1 < len; i += 2)
-  {
-    uint16_t word = ((uint16_t)pointer[i] << 8) | (uint16_t)pointer[i + 1];
-    sum += word;
-  }
-
-  /* If odd length, pad last byte with zeros on the right. */
-  if (len & 1)
-  {
-    uint16_t last = (uint16_t)pointer[len - 1] << 8;
-    sum += last;
-  }
-  /* Fold carries to 16 bits. */
-  while (sum >> 16)
-    sum = (sum & 0xFFFFu) + (sum >> 16);
-
-  return (uint16_t)~sum;
 }
 
 int verify_ip_checksum(sr_ip_hdr_t *ip_header, size_t len)
 {
   uint16_t original = ip_header->ip_sum;
-  uint16_t new = calculate_ip_checksum(ip_header, len);
+  ip_header->ip_sum = 0;
+  uint16_t new = cksum(ip_header, len);
 
-  ip_header->ip_sum = original; // restore back
+  ip_header->ip_sum = original; /* restore back */
   if (original == new)
   {
     return 1;
@@ -275,11 +320,107 @@ int verify_ip_checksum(sr_ip_hdr_t *ip_header, size_t len)
   return 0;
 }
 
-int handle_icmp_echo_req(struct sr_if *sr_interface, struct sr_packet_parts *packet_parts)
+int handle_icmp_echo_req(struct sr_instance *sr, struct sr_if *sr_interface, struct sr_packet_parts *packet_parts)
 {
-  // ETHERNET
+  /* ETHERNET */
   uint8_t dst_mac[ETHER_ADDR_LEN];
-  memcpy(dst_mac, packet_parts->ether_header->ether_shost, ETHER_ADDR_LEN); // set destination MAC address to source MAC
+  memcpy(dst_mac, packet_parts->ether_header->ether_shost, ETHER_ADDR_LEN); /* set destination MAC address to source MAC */
   memcpy(packet_parts->ether_header->ether_dhost, dst_mac, ETHER_ADDR_LEN);
-  memcpy(packet_parts->ether_header->ether_shost, sr_interface->addr, ETHER_ADDR_LEN); // set source to interface MAC address
+  memcpy(packet_parts->ether_header->ether_shost, sr_interface->addr, ETHER_ADDR_LEN); /* set source to interface MAC address */
+
+  /* IP4 */
+  sr_ip_hdr_t *ip_header = packet_parts->ip_header;
+  ip_header->ip_ttl = 64;           /* set ttl */
+  uint32_t tmp = ip_header->ip_src; /* update IP addresses. */
+  ip_header->ip_src = ip_header->ip_dst;
+  ip_header->ip_dst = tmp;
+  ip_header->ip_off = htons(0);                                              /* sanity check */
+  ip_header->ip_sum = 0;                                                     /* reset header to 0 to recalculate checksum */
+  ip_header->ip_sum = cksum(ip_header, (int)packet_parts->ip_header_length); /* set to new checksum */
+
+  /* ICMP */
+  sr_icmp_hdr_t *icmp_header = packet_parts->icmp_header;
+  if (!icmp_header)
+  {
+    printf("*** drop: ICMP header pointer NULL in echo handler\n");
+    return -1;
+  }
+  icmp_header->icmp_code = 0; /* set code to 0 for echo reply */
+  icmp_header->icmp_type = 0; /* set type to 0 for echo reply */
+
+  /* recalculate icmp checksum */
+  int total_ip_len = (int)ntohs(ip_header->ip_len);
+  int icmp_len = total_ip_len - (int)packet_parts->ip_header_length;
+  if (icmp_len < (int)sizeof(sr_icmp_hdr_t))
+  {
+    printf("*** drop: computed ICMP length too small: %d\n", icmp_len);
+    return -1;
+  }
+  icmp_header->icmp_sum = 0;
+  icmp_header->icmp_sum = cksum(icmp_header, icmp_len);
+
+  int total_len = (int)sizeof(sr_ethernet_hdr_t) + total_ip_len;
+  sr_send_packet(sr, (uint8_t *)packet_parts->ether_header, (unsigned)total_len, sr_interface->name);
+  printf("*** note: sent ICMP echo reply (%d bytes) on %s\n", total_len, sr_interface->name);
+  return 0;
+}
+
+int handle_arp_request(struct sr_instance *sr, struct sr_if *in_if, struct sr_packet_parts *packet_parts)
+{
+  sr_arp_hdr_t *arp = packet_parts->arp_header;
+  if (!arp)
+  {
+    printf("*** drop: ARP request handler but arp_header NULL\n");
+    return -1;
+  }
+
+  /* Find which of my interfaces owns the target IP (arp->ar_tip) */
+  struct sr_if *owner = sr->if_list;
+  while (owner && owner->ip != arp->ar_tip)
+    owner = owner->next;
+
+  if (!owner)
+  {
+    /* Not for me; ignore politely */
+    uint32_t tip_h = ntohl(arp->ar_tip);
+    printf("*** note: ARP request not for me (tip=%u.%u.%u.%u)\n",
+           (tip_h >> 24) & 0xFF, (tip_h >> 16) & 0xFF, (tip_h >> 8) & 0xFF, tip_h & 0xFF);
+    return 0;
+  }
+
+  /* Build ARP reply in-place */
+
+  /* L2 Ethernet: dst = requester MAC, src = my MAC (of interface that owns the IP) */
+  sr_ethernet_hdr_t *eth = packet_parts->ether_header;
+  memcpy(eth->ether_dhost, arp->ar_sha, ETHER_ADDR_LEN);
+  memcpy(eth->ether_shost, owner->addr, ETHER_ADDR_LEN);
+  eth->ether_type = htons(ethertype_arp);
+
+  /* L3 ARP: reply with my MAC/IP to the original sender MAC/IP */
+  /* Ensure fields are sane (not strictly required, but safe) */
+  arp->ar_hrd = htons(arp_hrd_ethernet);
+  arp->ar_pro = htons(ethertype_ip);
+  arp->ar_hln = ETHER_ADDR_LEN;
+  arp->ar_pln = 4;
+
+  arp->ar_op = htons(arp_op_reply);
+
+  unsigned char req_sha[ETHER_ADDR_LEN];
+  memcpy(req_sha, arp->ar_sha, ETHER_ADDR_LEN);
+  uint32_t req_sip = arp->ar_sip;
+
+  memcpy(arp->ar_sha, owner->addr, ETHER_ADDR_LEN); /* my MAC */
+  arp->ar_sip = owner->ip;                          /* my IP   */
+  memcpy(arp->ar_tha, req_sha, ETHER_ADDR_LEN);     /* target MAC = requester MAC */
+  arp->ar_tip = req_sip;                            /* target IP  = requester IP  */
+
+  int send_len = (int)(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t));
+  sr_send_packet(sr, (uint8_t *)eth, (unsigned)send_len, in_if->name);
+
+  uint32_t myip_h = ntohl(owner->ip);
+  printf("*** note: sent ARP reply %u.%u.%u.%u on %s\n",
+         (myip_h >> 24) & 0xFF, (myip_h >> 16) & 0xFF, (myip_h >> 8) & 0xFF, myip_h & 0xFF,
+         in_if->name);
+
+  return 0;
 }
