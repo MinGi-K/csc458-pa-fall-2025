@@ -83,9 +83,9 @@ void sr_handlepacket(struct sr_instance *sr, uint8_t *packet /* lent */,
   /* check for ARP */
   if (packet_parts->packet_type == L2_ARP)
   {
-    struct sr_if *in_if = sr_get_interface(sr, interface);
+    struct sr_if *sr_interface = sr_get_interface(sr, interface);
     /* sanity check */
-    if (!in_if)
+    if (!sr_interface)
     {
       printf("*** drop: ARP but sr_get_interface('%s') NULL\n", interface);
       free(packet_parts);
@@ -101,7 +101,7 @@ void sr_handlepacket(struct sr_instance *sr, uint8_t *packet /* lent */,
     uint16_t op = ntohs(packet_parts->arp_header->ar_op);
     if (op == arp_op_request)
     {
-      handle_arp_request(sr, in_if, packet_parts);
+      handle_arp_request(sr, sr_interface, packet_parts);
     }
     else
     {
@@ -365,10 +365,10 @@ int handle_icmp_echo_req(struct sr_instance *sr, struct sr_if *sr_interface, str
   return 0;
 }
 
-int handle_arp_request(struct sr_instance *sr, struct sr_if *in_if, struct sr_packet_parts *packet_parts)
+int handle_arp_request(struct sr_instance *sr, struct sr_if *sr_interface, struct sr_packet_parts *packet_parts)
 {
-  sr_arp_hdr_t *arp = packet_parts->arp_header;
-  if (!arp)
+  sr_arp_hdr_t *arp_header = (sr_arp_hdr_t *)packet_parts->arp_header;
+  if (!arp_header)
   {
     printf("*** drop: ARP request handler but arp_header NULL\n");
     return -1;
@@ -376,51 +376,51 @@ int handle_arp_request(struct sr_instance *sr, struct sr_if *in_if, struct sr_pa
 
   /* Find which of my interfaces owns the target IP (arp->ar_tip) */
   struct sr_if *owner = sr->if_list;
-  while (owner && owner->ip != arp->ar_tip)
+  while (owner && owner->ip != arp_header->ar_tip)
     owner = owner->next;
 
   if (!owner)
   {
-    /* Not for me; ignore politely */
-    uint32_t tip_h = ntohl(arp->ar_tip);
+    /* Not for me; ignore and drop silently */
+    uint32_t tip_h = ntohl(arp_header->ar_tip);
     printf("*** note: ARP request not for me (tip=%u.%u.%u.%u)\n",
            (tip_h >> 24) & 0xFF, (tip_h >> 16) & 0xFF, (tip_h >> 8) & 0xFF, tip_h & 0xFF);
     return 0;
   }
 
-  /* Build ARP reply in-place */
+  /* Construct ARP reply */
 
   /* L2 Ethernet: dst = requester MAC, src = my MAC (of interface that owns the IP) */
-  sr_ethernet_hdr_t *eth = packet_parts->ether_header;
-  memcpy(eth->ether_dhost, arp->ar_sha, ETHER_ADDR_LEN);
-  memcpy(eth->ether_shost, owner->addr, ETHER_ADDR_LEN);
-  eth->ether_type = htons(ethertype_arp);
+  sr_ethernet_hdr_t *ethernet_header = packet_parts->ether_header;
+  memcpy(ethernet_header->ether_dhost, arp_header->ar_sha, ETHER_ADDR_LEN); /* set destination MAC address to ARP MAC source*/
+  memcpy(ethernet_header->ether_shost, owner->addr, ETHER_ADDR_LEN);        /* set source MAC to interface MAC address*/
+  ethernet_header->ether_type = htons(ethertype_arp);
 
   /* L3 ARP: reply with my MAC/IP to the original sender MAC/IP */
-  /* Ensure fields are sane (not strictly required, but safe) */
-  arp->ar_hrd = htons(arp_hrd_ethernet);
-  arp->ar_pro = htons(ethertype_ip);
-  arp->ar_hln = ETHER_ADDR_LEN;
-  arp->ar_pln = 4;
+  arp_header->ar_hrd = htons(arp_hrd_ethernet); /* hardware is ethernet */
+  arp_header->ar_pro = htons(ethertype_ip);     /* resolving an IP request */
+  arp_header->ar_hln = ETHER_ADDR_LEN;
+  arp_header->ar_pln = 4;
 
-  arp->ar_op = htons(arp_op_reply);
+  arp_header->ar_op = htons(arp_op_reply); /* this is a reply */
 
-  unsigned char req_sha[ETHER_ADDR_LEN];
-  memcpy(req_sha, arp->ar_sha, ETHER_ADDR_LEN);
-  uint32_t req_sip = arp->ar_sip;
+  unsigned char req_sha[ETHER_ADDR_LEN];               /* requester's source hardware */
+  memcpy(req_sha, arp_header->ar_sha, ETHER_ADDR_LEN); /* copy the requester's hardware to temp var */
+  uint32_t req_sip = arp_header->ar_sip;               /* requester's source ip */
 
-  memcpy(arp->ar_sha, owner->addr, ETHER_ADDR_LEN); /* my MAC */
-  arp->ar_sip = owner->ip;                          /* my IP   */
-  memcpy(arp->ar_tha, req_sha, ETHER_ADDR_LEN);     /* target MAC = requester MAC */
-  arp->ar_tip = req_sip;                            /* target IP  = requester IP  */
+  memcpy(arp_header->ar_sha, owner->addr, ETHER_ADDR_LEN); /* set source hardware to interface MAC */
+  arp_header->ar_sip = owner->ip;                          /* set source ip to interface IP   */
+  memcpy(arp_header->ar_tha, req_sha, ETHER_ADDR_LEN);     /* set target MAC to saved requester MAC */
+  arp_header->ar_tip = req_sip;                            /* set target IP to saved requester IP  */
 
   int send_len = (int)(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t));
-  sr_send_packet(sr, (uint8_t *)eth, (unsigned)send_len, in_if->name);
+  sr_send_packet(sr, (uint8_t *)ethernet_header, (unsigned)send_len, sr_interface->name);
 
+  /* LOGGING THAT IT WORKS */
   uint32_t myip_h = ntohl(owner->ip);
   printf("*** note: sent ARP reply %u.%u.%u.%u on %s\n",
          (myip_h >> 24) & 0xFF, (myip_h >> 16) & 0xFF, (myip_h >> 8) & 0xFF, myip_h & 0xFF,
-         in_if->name);
+         sr_interface->name);
 
   return 0;
 }
