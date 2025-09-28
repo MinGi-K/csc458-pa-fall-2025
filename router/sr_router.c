@@ -105,8 +105,7 @@ void sr_handlepacket(struct sr_instance *sr, uint8_t *packet /* lent */,
     }
     else
     {
-      /* TODO: handle arp dispatch later. */
-      printf("*** note: ARP op=0x%04x ignored for now\n", op);
+      handle_arp_reply(sr, packet_parts);
     }
 
     free(packet_parts);
@@ -149,12 +148,12 @@ void sr_handlepacket(struct sr_instance *sr, uint8_t *packet /* lent */,
       }
       handle_icmp_echo_req(sr, actual_interface, packet_parts);
     }
-    /* else: other to-me traffic (TCP/UDP) not handled yet in Phase 2 */
+    /* else: not an ICMP request but it is also to router - TODO */
   }
   else
   {
     /* Not for me; forwarding not implemented yet */
-    printf("*** drop: dst is not router IP (forwarding not implemented yet)\n");
+    handle_forwarding(sr, packet_parts);
   }
 
   free(packet_parts);
@@ -414,7 +413,7 @@ int handle_arp_request(struct sr_instance *sr, struct sr_if *sr_interface, struc
   arp_header->ar_tip = req_sip;                            /* set target IP to saved requester IP  */
 
   int send_len = (int)(sizeof(sr_ethernet_hdr_t) + sizeof(sr_arp_hdr_t));
-  sr_send_packet(sr, (uint8_t *)ethernet_header, (unsigned)send_len, sr_interface->name);
+  sr_send_packet(sr, (uint8_t *)ethernet_header, (unsigned)send_len, owner->name);
 
   /* LOGGING THAT IT WORKS */
   uint32_t myip_h = ntohl(owner->ip);
@@ -423,4 +422,150 @@ int handle_arp_request(struct sr_instance *sr, struct sr_if *sr_interface, struc
          sr_interface->name);
 
   return 0;
+}
+
+int handle_forwarding(struct sr_instance *sr, struct sr_packet_parts *packet_parts)
+{
+  /* TTL and IP checksum */
+  sr_ip_hdr_t *ip_header = packet_parts->ip_header;
+  if (ip_header->ip_ttl <= 1)
+  {
+    printf("*** drop->icmp time-exceeded: ttl<=1\n");
+    /* TODO: build/send ICMP Time Exceeded (Type 11, Code 0) */
+    return 3;
+  }
+  ip_header->ip_ttl--;
+  ip_header->ip_sum = 0;
+  ip_header->ip_sum = cksum(ip_header, packet_parts->ip_header_length);
+
+  /* Longest-prefix match */
+  struct sr_rt *route = lpm(sr, ip_header->ip_dst);
+  if (!route)
+  {
+    printf("*** drop->icmp net-unreach: no route for dst\n");
+    /* TODO: ICMP Destination Net Unreachable (Type 3, Code 0) */
+    return 4;
+  }
+
+  /* Outgoing interface */
+  struct sr_if *out_interface = sr_get_interface(sr, route->interface);
+  if (!out_interface)
+  {
+    printf("*** drop: sr_get_interface('%s') returned NULL\n", route->interface);
+    return 1;
+  }
+
+  /* Next hop IP: gateway if present, else final destination */
+  uint32_t next_hop = (route->gw.s_addr != 0) ? route->gw.s_addr : ip_header->ip_dst;
+
+  /* Fill what we can in L2 now */
+  sr_ethernet_hdr_t *eth = packet_parts->ether_header;
+  eth->ether_type = htons(ethertype_ip);
+  memcpy(eth->ether_shost, out_interface->addr, ETHER_ADDR_LEN);
+
+  /* ARP cache lookup */
+  struct sr_arpentry *arp_entry = sr_arpcache_lookup(&sr->cache, next_hop);
+  if (!arp_entry)
+  {
+    /* ARP miss: queue a heap copy of the FULL frame */
+    uint8_t *copy = (uint8_t *)malloc(packet_parts->frame_length);
+    if (!copy)
+    {
+      printf("*** drop: OOM on ARP miss\n");
+      return 6;
+    }
+    memcpy(copy, packet_parts->frame, packet_parts->frame_length);
+
+    (void)sr_arpcache_queuereq(&sr->cache, next_hop,
+                               copy, packet_parts->frame_length,
+                               out_interface->name);
+    free(copy);
+    return 2;
+  }
+
+  /* ARP hit: set dst MAC and send */
+  memcpy(eth->ether_dhost, arp_entry->mac, ETHER_ADDR_LEN);
+  sr_send_packet(sr, packet_parts->frame, packet_parts->frame_length, out_interface->name);
+  free(arp_entry);
+  return 0;
+}
+
+struct sr_rt *lpm(struct sr_instance *sr, uint32_t dst_ip_nbo)
+{
+  struct sr_rt *best = NULL;
+  uint32_t best_mask = 0;
+
+  for (struct sr_rt *rt = sr->routing_table; rt; rt = rt->next)
+  {
+    uint32_t mask = rt->mask.s_addr;      /* net order */
+    uint32_t route_dst = rt->dest.s_addr; /* net order */
+    if ((dst_ip_nbo & mask) == (route_dst & mask))
+    {
+      /* Prefer the longest mask */
+      if (ntohl(mask) > ntohl(best_mask))
+      {
+        best = rt;
+        best_mask = mask;
+      }
+    }
+  }
+  return best;
+}
+
+static int is_router_ip(struct sr_instance *sr, uint32_t ip_nbo)
+{
+  for (struct sr_if *it = sr->if_list; it; it = it->next)
+  {
+    if (it->ip == ip_nbo)
+      return 1;
+  }
+  return 0;
+}
+
+void handle_arp_reply(struct sr_instance *sr, struct sr_packet_parts *P)
+{
+  sr_arp_hdr_t *arp_header = P->arp_header;
+
+  /* Sanity check: only process ARP replies meant for router */
+  /* These shouldn't really trigger */
+  if (ntohs(arp_header->ar_op) != arp_op_reply)
+  {
+    printf("handle arp reply, not actually an arp reply.");
+    return;
+  }
+  if (!is_router_ip(sr, arp_header->ar_tip))
+  {
+    return;
+  }
+
+  /* Insert mapping; get any pending request for this IP */
+  struct sr_arpreq *req = sr_arpcache_insert(&sr->cache, arp_header->ar_sha, arp_header->ar_sip);
+  if (!req)
+    return; /* no queued packets were waiting */
+
+  /* Flush all queued packets waiting on this mapping */
+  struct sr_packet *packet = req->packets;
+  while (packet)
+  {
+    struct sr_packet *next = packet->next;
+
+    /* Outgoing interface recorded when we queued the packet */
+    struct sr_if *out_interface = sr_get_interface(sr, packet->iface);
+    if (out_interface)
+    {
+      sr_ethernet_hdr_t *eth = (sr_ethernet_hdr_t *)packet->buf;
+
+      /* L2: Ethernet */
+      memcpy(eth->ether_shost, out_interface->addr, ETHER_ADDR_LEN);
+      memcpy(eth->ether_dhost, arp_header->ar_sha, ETHER_ADDR_LEN);
+      eth->ether_type = htons(ethertype_ip);
+
+      sr_send_packet(sr, packet->buf, packet->len, packet->iface);
+    }
+
+    packet = next;
+  }
+
+  /* free the arpreq */
+  sr_arpreq_destroy(&sr->cache, req);
 }
