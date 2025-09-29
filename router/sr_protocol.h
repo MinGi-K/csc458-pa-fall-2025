@@ -160,7 +160,7 @@ struct sr_arp_hdr
 } __attribute__((packed));
 typedef struct sr_arp_hdr sr_arp_hdr_t;
 
-/* L2 because its on the second layer of the onion */
+/* L2 */
 typedef enum
 {
   L2_UNKNOWN = 0,
@@ -168,7 +168,7 @@ typedef enum
   L2_ARP,
 } packet_type_t;
 
-/* because it is the third layer of the onion */
+/* L3  */
 typedef enum
 {
   L3_NONE = 0,

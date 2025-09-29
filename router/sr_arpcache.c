@@ -27,7 +27,7 @@ void sr_arpcache_sweepreqs(struct sr_instance *sr)
   {
     struct sr_arpreq *next = request->next;
     handle_arpreq(sr, request);
-    request = request->next;
+    request = next;
   }
 }
 
@@ -42,8 +42,24 @@ void handle_arpreq(struct sr_instance *sr, struct sr_arpreq *request)
   }
   if (request->times_sent >= 5)
   {
-    /* Sent over 5 times. Drop request */
-    /* TODO: send a ICMP unreachable/timeout */
+    /* Sent over 5 times. */
+    /* send a ICMP unreachable/timeout */
+    struct sr_packet *packet = request->packets;
+    while (packet)
+    {
+      struct sr_packet *next = packet->next;
+      struct sr_packet_parts packet_parts;
+      int error = parse_frame(packet->buf, packet->len, &packet_parts);
+      if (error != 0)
+      {
+        printf("arprequest sent > 5: parsing packet parts failed");
+        sr_arpreq_destroy(&(sr->cache), request);
+        return;
+      }
+      struct sr_if *out_interface = sr_get_interface(sr, packet->iface);
+      send_icmp_t3_response(sr, out_interface, &packet_parts, 3, 1); /* host is unreachable */
+      packet = next;
+    }
     sr_arpreq_destroy(&(sr->cache), request);
     return;
   }

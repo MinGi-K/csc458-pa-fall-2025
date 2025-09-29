@@ -11,6 +11,15 @@
 #include "sr_rt.h"
 #include "sr_utils.h"
 
+/* sr_router.c private helpers (file-local) */
+int is_router_ip(struct sr_instance *sr, uint32_t ip_nbo);
+int handle_forwarding(struct sr_instance *sr, struct sr_packet_parts *packet_parts, struct sr_if *in_interface);
+int handle_icmp_echo_req(struct sr_instance *sr, struct sr_if *itf, struct sr_packet_parts *P);
+int handle_arp_request(struct sr_instance *sr, struct sr_if *itf, struct sr_packet_parts *P);
+void handle_arp_reply(struct sr_instance *sr, struct sr_packet_parts *P);
+int dispatch_arp_request(struct sr_instance *sr, struct sr_if *itf, uint32_t tip_nbo);
+struct sr_rt *longest_prefix_match(struct sr_instance *sr, uint32_t dst_ip_nbo);
+
 /*---------------------------------------------------------------------
  * Method: sr_init(void)
  * Scope:  Global
@@ -148,12 +157,32 @@ void sr_handlepacket(struct sr_instance *sr, uint8_t *packet /* lent */,
       }
       handle_icmp_echo_req(sr, actual_interface, packet_parts);
     }
-    /* else: not an ICMP request but it is also to router - TODO */
+    /* else: not an ICMP request but it is also to router */
+    /* If it is TCP/UDP, send an ICMP destination not reachable*/
+    if (packet_parts->ip_protocol_type &&
+        (packet_parts->ip_protocol_type == L3_TCP || packet_parts->ip_protocol_type == L3_UDP))
+    {
+      struct sr_if *actual_interface = sr_get_interface(sr, interface);
+      if (!actual_interface)
+      {
+        printf("*** drop: sr_get_interface('%s') returned NULL\n", interface);
+        free(packet_parts);
+        return;
+      }
+      send_port_unreachable(sr, actual_interface, packet_parts);
+    }
   }
   else
   {
-    /* Not for me; forwarding not implemented yet */
-    handle_forwarding(sr, packet_parts);
+    /* Not for me; forward the packet */
+    struct sr_if *in_interface = sr_get_interface(sr, interface);
+    if (!in_interface)
+    {
+      printf("*** drop: sr_get_interface('%s') returned NULL\n", interface);
+      free(packet_parts);
+      return;
+    }
+    handle_forwarding(sr, packet_parts, in_interface);
   }
 
   free(packet_parts);
@@ -344,6 +373,20 @@ int handle_icmp_echo_req(struct sr_instance *sr, struct sr_if *sr_interface, str
     printf("*** drop: ICMP header pointer NULL in echo handler\n");
     return -1;
   }
+
+  /* Verify ICMP checksum for echo request */
+  uint16_t original_sum = packet_parts->icmp_header->icmp_sum;
+  packet_parts->icmp_header->icmp_sum = 0;
+  uint16_t new_sum = cksum(packet_parts->icmp_header,
+                           ntohs(packet_parts->ip_header->ip_len) - packet_parts->ip_header_length);
+  packet_parts->icmp_header->icmp_sum = original_sum;
+  if (original_sum != new_sum)
+  {
+    printf("*** drop: bad ICMP checksum on echo request\n");
+    free(packet_parts);
+    return;
+  }
+
   icmp_header->icmp_code = 0; /* set code to 0 for echo reply */
   icmp_header->icmp_type = 0; /* set type to 0 for echo reply */
 
@@ -362,6 +405,81 @@ int handle_icmp_echo_req(struct sr_instance *sr, struct sr_if *sr_interface, str
   sr_send_packet(sr, (uint8_t *)packet_parts->ether_header, (unsigned)total_len, sr_interface->name);
   printf("*** note: sent ICMP echo reply (%d bytes) on %s\n", total_len, sr_interface->name);
   return 0;
+}
+
+/* SEND ICMP response back to source. */
+void send_icmp_t3_response(struct sr_instance *sr, struct sr_if *out_interface, struct sr_packet_parts *packet_parts, uint8_t type, uint8_t code)
+{
+  enum
+  {
+    PACKETLEN = sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_t3_hdr_t)
+  };
+  uint8_t buf[PACKETLEN];
+  sr_ethernet_hdr_t *ether_header = (sr_ethernet_hdr_t *)(buf);
+  sr_ip_hdr_t *ip_header = (sr_ip_hdr_t *)(buf + sizeof(sr_ethernet_hdr_t));
+  sr_icmp_t3_hdr_t *icmp_header = (sr_icmp_t3_hdr_t *)(buf + sizeof(sr_ethernet_hdr_t) + sizeof(sr_ip_hdr_t));
+
+  /* L2 Ethernet */
+  memcpy(ether_header->ether_dhost, packet_parts->ether_header->ether_shost, ETHER_ADDR_LEN);
+  memcpy(ether_header->ether_shost, out_interface->addr, ETHER_ADDR_LEN);
+  ether_header->ether_type = htons(ethertype_ip);
+
+  /* L3 IP */
+  /* source/destination - original source and router. */
+  ip_header->ip_src = out_interface->ip;
+  ip_header->ip_dst = packet_parts->ip_header->ip_src;
+
+  /* other metadata*/
+  ip_header->ip_p = ip_protocol_icmp;
+  ip_header->ip_v = 4;  /* IP4*/
+  ip_header->ip_hl = 5; /* 20 bytes */
+  ip_header->ip_tos = 0;
+  ip_header->ip_len = htons((uint16_t)(sizeof(sr_ip_hdr_t) + sizeof(sr_icmp_t3_hdr_t)));
+  ip_header->ip_id = 0;
+  ip_header->ip_off = htons(0);
+  ip_header->ip_ttl = 64;
+
+  /* recompute checksum */
+  ip_header->ip_sum = 0;
+  ip_header->ip_sum = cksum(ip_header, sizeof(sr_ip_hdr_t));
+
+  /* L4 ICMP */
+  memset(icmp_header, 0, sizeof(sr_icmp_t3_hdr_t));
+
+  /* Copy Original IP header */
+  const uint8_t *orig_ip = (const uint8_t *)packet_parts->ip_header;
+  size_t avail = packet_parts->frame_length - sizeof(sr_ethernet_hdr_t);
+  size_t want = (size_t)packet_parts->ip_header_length + 8;
+  size_t bytes_to_copy = want;
+  if (bytes_to_copy > ICMP_DATA_SIZE) /* bytes to copy = min(bytes_to_copy, icmp data size)*/
+    bytes_to_copy = ICMP_DATA_SIZE;
+  if (bytes_to_copy > avail) /* bytes_to_copy = min(bytes_to_copy, avail)*/
+    bytes_to_copy = avail;
+  memcpy(icmp_header->data, orig_ip, bytes_to_copy);
+
+  /* ICMP codes */
+  icmp_header->icmp_code = code;
+  icmp_header->icmp_type = type;
+  icmp_header->icmp_sum = 0;
+  icmp_header->icmp_sum = cksum(icmp_header, sizeof(sr_icmp_t3_hdr_t));
+
+  sr_send_packet(sr, buf, PACKETLEN, out_interface->name);
+}
+
+/* Time exceeded - when TTL expired while forwarding */
+void send_time_exceeded(struct sr_instance *sr,
+                        struct sr_if *in_interface,
+                        struct sr_packet_parts *packet_parts)
+{
+  send_icmp_t3_response(sr, in_interface, packet_parts, 11, 0);
+}
+
+/* Port Unreachable - when arp request time out or UDP timeout request. */
+void send_port_unreachable(struct sr_instance *sr,
+                           struct sr_if *in_interface,
+                           struct sr_packet_parts *packet_parts)
+{
+  send_icmp_t3_response(sr, in_interface, packet_parts, 3, 3);
 }
 
 int handle_arp_request(struct sr_instance *sr, struct sr_if *sr_interface, struct sr_packet_parts *packet_parts)
@@ -424,26 +542,29 @@ int handle_arp_request(struct sr_instance *sr, struct sr_if *sr_interface, struc
   return 0;
 }
 
-int handle_forwarding(struct sr_instance *sr, struct sr_packet_parts *packet_parts)
+int handle_forwarding(struct sr_instance *sr,
+                      struct sr_packet_parts *packet_parts,
+                      struct sr_if *in_interface)
 {
   /* TTL and IP checksum */
   sr_ip_hdr_t *ip_header = packet_parts->ip_header;
-  if (ip_header->ip_ttl <= 1)
+  /* Check time exceeded */
+  if (packet_parts->ip_header->ip_ttl <= 1)
   {
     printf("*** drop->icmp time-exceeded: ttl<=1\n");
-    /* TODO: build/send ICMP Time Exceeded (Type 11, Code 0) */
-    return 3;
+    send_time_exceeded(sr, in_interface, packet_parts);
+    return;
   }
   ip_header->ip_ttl--;
   ip_header->ip_sum = 0;
   ip_header->ip_sum = cksum(ip_header, packet_parts->ip_header_length);
 
   /* Longest-prefix match */
-  struct sr_rt *route = lpm(sr, ip_header->ip_dst);
+  struct sr_rt *route = longest_prefix_match(sr, ip_header->ip_dst);
   if (!route)
   {
     printf("*** drop->icmp net-unreach: no route for dst\n");
-    /* TODO: ICMP Destination Net Unreachable (Type 3, Code 0) */
+    send_icmp_t3_response(sr, in_interface, packet_parts, 3, 0); /* net unreachable*/
     return 4;
   }
 
@@ -490,13 +611,15 @@ int handle_forwarding(struct sr_instance *sr, struct sr_packet_parts *packet_par
   return 0;
 }
 
-struct sr_rt *lpm(struct sr_instance *sr, uint32_t dst_ip_nbo)
+struct sr_rt *longest_prefix_match(struct sr_instance *sr, uint32_t dst_ip_nbo)
 {
   struct sr_rt *best = NULL;
   uint32_t best_mask = 0;
+  struct sr_rt *rt = sr->routing_table;
 
-  for (struct sr_rt *rt = sr->routing_table; rt; rt = rt->next)
+  while (rt)
   {
+    struct sr_rt *next = rt->next;
     uint32_t mask = rt->mask.s_addr;      /* net order */
     uint32_t route_dst = rt->dest.s_addr; /* net order */
     if ((dst_ip_nbo & mask) == (route_dst & mask))
@@ -508,16 +631,22 @@ struct sr_rt *lpm(struct sr_instance *sr, uint32_t dst_ip_nbo)
         best_mask = mask;
       }
     }
+    rt = next;
   }
   return best;
 }
 
-static int is_router_ip(struct sr_instance *sr, uint32_t ip_nbo)
+int is_router_ip(struct sr_instance *sr, uint32_t ip_nbo)
 {
-  for (struct sr_if *it = sr->if_list; it; it = it->next)
+  struct sr_if *interface = sr->if_list;
+  while (interface)
   {
-    if (it->ip == ip_nbo)
+    struct sr_if *next = interface->next;
+    if (interface->ip == ip_nbo)
+    {
       return 1;
+    }
+    interface = next;
   }
   return 0;
 }

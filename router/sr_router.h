@@ -72,6 +72,22 @@ int sr_read_from_server(struct sr_instance *);
 /* -- sr_router.c -- */
 void sr_init(struct sr_instance *);
 void sr_handlepacket(struct sr_instance *, uint8_t *, unsigned int, char *);
+/* Packet parsing */
+int parse_frame(uint8_t *frame, unsigned int len, struct sr_packet_parts *parts);
+
+/* ICMP helpers */
+void send_icmp_t3_response(struct sr_instance *sr,
+                           struct sr_if *out_interface,
+                           struct sr_packet_parts *packet_parts,
+                           uint8_t type, uint8_t code);
+
+void send_time_exceeded(struct sr_instance *sr,
+                        struct sr_if *in_interface,
+                        struct sr_packet_parts *packet_parts);
+
+void send_port_unreachable(struct sr_instance *sr,
+                           struct sr_if *in_interface,
+                           struct sr_packet_parts *packet_parts);
 
 /* -- sr_if.c -- */
 void sr_add_interface(struct sr_instance *, const char *);
