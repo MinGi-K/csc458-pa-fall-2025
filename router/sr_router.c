@@ -14,10 +14,10 @@
 /* sr_router.c private helpers (file-local) */
 int is_router_ip(struct sr_instance *sr, uint32_t ip_nbo);
 int handle_forwarding(struct sr_instance *sr, struct sr_packet_parts *packet_parts, struct sr_if *in_interface);
-int handle_icmp_echo_req(struct sr_instance *sr, struct sr_if *itf, struct sr_packet_parts *P);
-int handle_arp_request(struct sr_instance *sr, struct sr_if *itf, struct sr_packet_parts *P);
-void handle_arp_reply(struct sr_instance *sr, struct sr_packet_parts *P);
-int dispatch_arp_request(struct sr_instance *sr, struct sr_if *itf, uint32_t tip_nbo);
+int handle_icmp_echo_req(struct sr_instance *sr, struct sr_if *interface, struct sr_packet_parts *packet_parts);
+int handle_arp_request(struct sr_instance *sr, struct sr_if *interface, struct sr_packet_parts *packet_parts);
+void handle_arp_reply(struct sr_instance *sr, struct sr_packet_parts *packet_parts);
+int dispatch_arp_request(struct sr_instance *sr, struct sr_if *interface, uint32_t tip_nbo);
 struct sr_rt *longest_prefix_match(struct sr_instance *sr, uint32_t dst_ip_nbo);
 
 /*---------------------------------------------------------------------
